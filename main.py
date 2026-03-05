@@ -32,7 +32,9 @@ MAX_HISTORY = 20  # 每個用戶保留最多幾輪對話
 
 # ── 狀態 ──────────────────────────────────────────────
 conversation_history: dict[str, list] = {}  # user_id -> message list
+daily_log: list = []  # 當天所有對話記錄，供每日摘要用
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+SYNC_SECRET = os.environ.get("PASSWORD", "")
 
 # ── 工具定義 ──────────────────────────────────────────
 TOOLS = [
@@ -278,6 +280,13 @@ async def webhook(request: Request):
             reply = await chat_with_claude(user_id, user_text)
             await send_line_reply(reply_token, reply)
 
+            # 記錄到 daily_log
+            daily_log.append({
+                "time": datetime.now().strftime("%H:%M"),
+                "user": user_text,
+                "reply": reply[:500]
+            })
+
             # 自動偵測重要資訊（若 Claude 回覆包含決策/待辦/結論，同步記錄）
             important_keywords = ["決定", "確認", "待辦", "簽約", "錄用", "開幕", "結論", "記住"]
             if any(kw in user_text for kw in important_keywords):
@@ -293,7 +302,39 @@ async def webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "memory_loaded": MEMORY_PATH.exists()}
+    return {"status": "ok", "memory_loaded": MEMORY_PATH.exists(), "daily_log_count": len(daily_log)}
+
+
+@app.get("/daily-summary")
+async def daily_summary(secret: str = ""):
+    """每日摘要 endpoint，供 Mac 本地 cron job 呼叫更新 MEMORY.md"""
+    if not SYNC_SECRET or secret != SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not daily_log:
+        return {"summary": "", "count": 0, "date": datetime.now().strftime("%Y-%m-%d")}
+
+    # 用 Claude 產生摘要
+    log_text = "\n".join([
+        f"[{item['time']}] Aaron：{item['user']}\n助理：{item['reply']}"
+        for item in daily_log
+    ])
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    response = await anthropic_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=800,
+        messages=[{
+            "role": "user",
+            "content": f"以下是 {date_str} Aaron 與 LINE bot 的對話記錄，請用繁體中文摘要成3-5個重點，格式為條列式，重點包含：決策、待辦、重要資訊、結論。如果沒有重要內容就寫「無重要事項」。\n\n{log_text}"
+        }]
+    )
+    summary = response.content[0].text
+
+    # 清空 daily_log（已摘要）
+    daily_log.clear()
+
+    return {"summary": summary, "count": len(log_text), "date": date_str}
 
 
 if __name__ == "__main__":
