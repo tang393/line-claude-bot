@@ -24,7 +24,7 @@ app = FastAPI()
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "BSAlYaFVv3v-1pGTNVz-j_9LZKROFly")
+BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 
 MEMORY_PATH = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
 LINE_LOG_PATH = Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
