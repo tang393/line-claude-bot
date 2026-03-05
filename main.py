@@ -134,22 +134,37 @@ async def process_tool_call(tool_name: str, tool_input: dict) -> str:
     return "未知工具"
 
 
-async def chat_with_claude(user_id: str, user_message: str) -> str:
-    """呼叫 Claude API，支援對話歷史 + 工具"""
+async def chat_with_claude(user_id: str, user_message: str, image_data: bytes | None = None) -> str:
+    """呼叫 Claude API，支援對話歷史 + 工具 + 圖片"""
     # 初始化歷史
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
+    # 組合 content（圖片 + 文字）；歷史只存文字 placeholder 避免 context 爆炸
+    if image_data:
+        img_b64 = base64.b64encode(image_data).decode("utf-8")
+        current_content = [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+            {"type": "text", "text": user_message if user_message != "（圖片）" else "請描述這張圖片，並依據我的背景給出相關建議或見解。"}
+        ]
+        history_content = "（傳送了一張圖片）"
+    else:
+        current_content = user_message
+        history_content = user_message
+
+    # 歷史存文字版本，當前請求用完整內容
     conversation_history[user_id].append({
         "role": "user",
-        "content": user_message
+        "content": history_content
     })
 
     # 限制歷史長度
     if len(conversation_history[user_id]) > MAX_HISTORY * 2:
         conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY * 2:]
 
-    messages = conversation_history[user_id].copy()
+    # 發送給 API 的 messages：歷史用文字，當前訊息替換成完整 content（含圖片）
+    messages = conversation_history[user_id][:-1].copy()
+    messages.append({"role": "user", "content": current_content})
     system = build_system_prompt()
 
     # 最多跑 5 輪工具呼叫
@@ -207,6 +222,17 @@ def verify_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+async def download_line_media(message_id: str) -> bytes | None:
+    """下載 LINE 媒體（圖片等）"""
+    url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}"}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            return resp.content
+        return None
+
+
 async def send_loading_animation(user_id: str, seconds: int = 30):
     """顯示「回覆中」載入動畫"""
     url = "https://api.line.me/v2/bot/chat/loading/start"
@@ -250,14 +276,34 @@ async def webhook(request: Request):
     for event in data.get("events", []):
         if event.get("type") != "message":
             continue
-        if event.get("message", {}).get("type") != "text":
+
+        msg_type = event.get("message", {}).get("type")
+        if msg_type not in ("text", "image"):
             continue
 
         user_id = event["source"]["userId"]
-        user_text = event["message"]["text"]
         reply_token = event["replyToken"]
+        msg_id = event["message"]["id"]
 
         try:
+            # 圖片訊息：下載並傳給 Claude
+            if msg_type == "image":
+                await send_loading_animation(user_id, seconds=30)
+                image_data = await download_line_media(msg_id)
+                if image_data:
+                    reply = await chat_with_claude(user_id, "（圖片）", image_data=image_data)
+                else:
+                    reply = "圖片下載失敗，請重試"
+                await send_line_reply(reply_token, reply)
+                daily_log.append({
+                    "time": datetime.now().strftime("%H:%M"),
+                    "user": "（圖片）",
+                    "reply": reply[:500]
+                })
+                continue
+
+            user_text = event["message"]["text"]
+
             # 指令：/記住 [內容]
             if user_text.startswith("/記住") or user_text.startswith("/remember"):
                 content = user_text.replace("/記住", "").replace("/remember", "").strip()
@@ -294,7 +340,7 @@ async def webhook(request: Request):
 
         except Exception as e:
             import traceback
-            print(f"[ERROR] user={user_id} msg={user_text[:50]!r}\n{traceback.format_exc()}")
+            print(f"[ERROR] user={user_id} msg_type={msg_type}\n{traceback.format_exc()}")
             await send_line_reply(reply_token, f"出錯了：{str(e)[:200]}")
 
     return JSONResponse({"status": "ok"})
