@@ -424,12 +424,15 @@ async def webhook(request: Request):
 
 @app.get("/health")
 async def health():
+    import shutil
     memory_loaded = MEMORY_PATH.exists() or bool(os.environ.get("MEMORY_CONTENT", ""))
     groq_ready = bool(GROQ_API_KEY)
+    ffmpeg_ready = shutil.which("ffmpeg") is not None
     return {
         "status": "ok",
         "memory_loaded": memory_loaded,
         "groq_ready": groq_ready,
+        "ffmpeg_ready": ffmpeg_ready,
         "daily_log_count": len(daily_log)
     }
 
