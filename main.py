@@ -302,7 +302,8 @@ async def webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "memory_loaded": MEMORY_PATH.exists(), "daily_log_count": len(daily_log)}
+    memory_loaded = MEMORY_PATH.exists() or bool(os.environ.get("MEMORY_CONTENT", ""))
+    return {"status": "ok", "memory_loaded": memory_loaded, "daily_log_count": len(daily_log)}
 
 
 @app.get("/daily-summary")
