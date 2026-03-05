@@ -32,7 +32,7 @@ MAX_HISTORY = 20  # 每個用戶保留最多幾輪對話
 
 # ── 狀態 ──────────────────────────────────────────────
 conversation_history: dict[str, list] = {}  # user_id -> message list
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── 工具定義 ──────────────────────────────────────────
 TOOLS = [
@@ -152,7 +152,7 @@ async def chat_with_claude(user_id: str, user_message: str) -> str:
 
     # 最多跑 5 輪工具呼叫
     for _ in range(5):
-        response = anthropic_client.messages.create(
+        response = await anthropic_client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2000,
             system=system,
@@ -284,6 +284,8 @@ async def webhook(request: Request):
                 save_to_memory(f"Aaron（LINE）：{user_text}\n助理回覆：{reply[:300]}")
 
         except Exception as e:
+            import traceback
+            print(f"[ERROR] user={user_id} msg={user_text[:50]!r}\n{traceback.format_exc()}")
             await send_line_reply(reply_token, f"出錯了：{str(e)[:200]}")
 
     return JSONResponse({"status": "ok"})
