@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 LINE Claude Bot - Aaron 的全知全能私人助理
-工具：網路搜尋、Gmail 收發、提醒事項、圖片/語音/影片分析
+工具：網路搜尋、Gmail 收發、天氣、網頁瀏覽、提醒事項、圖片/語音/影片分析
+主動功能：重要郵件推播、每日晨報（含天氣）
 """
 
 import os
@@ -37,16 +38,25 @@ GROQ_API_KEY             = os.environ.get("GROQ_API_KEY", "")
 GMAIL_ADDRESS            = os.environ.get("GMAIL_ADDRESS", "")
 GMAIL_APP_PASSWORD       = os.environ.get("GMAIL_APP_PASSWORD", "")
 SYNC_SECRET              = os.environ.get("PASSWORD", "")
+MAC_SERVICE_URL          = os.environ.get("MAC_SERVICE_URL", "")  # Mac Computer Use 服務 URL
 
 MEMORY_PATH  = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
 LINE_LOG_PATH= Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
 MAX_HISTORY  = 20
+
+# 重要郵件關鍵字
+IMPORTANT_EMAIL_KEYWORDS = [
+    "合約", "協議", "緊急", "urgent", "important", "付款", "帳單", "invoice",
+    "overdue", "逾期", "截止", "deadline", "簽約", "URGENT", "ACTION REQUIRED",
+    "開幕", "執照", "股東", "律師", "legal", "court", "lawsuit", "罰款"
+]
 
 # ── 狀態 ──────────────────────────────────────────────
 conversation_history: dict[str, list] = {}
 daily_log: list = []
 known_user_ids: list = []   # 存已知的 LINE user_id，供主動推播用
 reminders: list = []        # [{text, time_hint, created}]
+seen_email_ids: set = set() # 已推播的郵件 ID，避免重複推播
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── 記憶 ──────────────────────────────────────────────
@@ -83,6 +93,7 @@ def build_system_prompt() -> str:
     memory = get_memory()
     today  = datetime.now().strftime("%Y-%m-%d %A")
     gmail_status = "已連接（可收發信）" if GMAIL_ADDRESS else "未設定"
+    mac_status = "已連接（可控制瀏覽器）" if MAC_SERVICE_URL else "未設定"
 
     return f"""# LAYER 1 — 身份與範疇
 你是 Aaron（湯凱賀）的私人全知全能助理，透過 LINE 24/7 待命。
@@ -98,6 +109,14 @@ web_search：
 ・用於：最新市場數據、競品、法規、新聞、任何你不確定的即時資訊
 ・禁止：查你已知的常識性問題
 
+get_weather：
+・用於：查天氣，預設查胡志明市和台北兩個城市
+・Aaron 問天氣時立刻查，不要說「你可以去查」
+
+browse_url：
+・用於：直接開啟網頁讀取內容，競品網站、法規文件、新聞原文
+・比搜尋更精準，當你有確切網址時優先用這個
+
 send_email：
 ・狀態：{gmail_status}
 ・用於：代 Aaron 起草並發送正式信件
@@ -111,6 +130,12 @@ read_emails：
 
 set_reminder：
 ・用於：Aaron 說「記住」「提醒我」「待辦」時，立即存入提醒清單
+
+computer_use_task：
+・狀態：{mac_status}
+・用於：讓 Mac 電腦實際執行任務（開瀏覽器、填表、發文、訂票）
+・Aaron 說「幫我去」「直接做」「到網站上」時使用
+・描述任務即可，Mac 會自動執行
 
 # LAYER 4 — 記憶規則
 ・Aaron 說「記住 [XXX]」→ 立即用 set_reminder 存入，同時確認「已記住：[XXX]」
@@ -132,13 +157,14 @@ set_reminder：
 ・給建議時直接說結論，原因放後面
 
 # LAYER 7 — 自主決定 vs 先請示
-自主決定（直接做）：研究分析、起草文件、搜尋資訊、記錄事項、提供建議
+自主決定（直接做）：研究分析、起草文件、搜尋資訊、記錄事項、提供建議、查天氣、瀏覽網頁
 先請示再做：發送郵件、重大財務建議、對外聯繫、刪除或不可逆操作
 
 # LAYER 8 — 當前環境
 今天：{today}
 Gmail：{gmail_status}
-語音辨識：{'已啟用' if GROQ_API_KEY else '未啟用'}"""
+語音辨識：{'已啟用' if GROQ_API_KEY else '未啟用'}
+Mac 遠端控制：{mac_status}"""
 
 
 # ── 工具實作 ──────────────────────────────────────────
@@ -148,6 +174,24 @@ TOOLS = [
         "name": "web_search",
         "description": "搜尋網路最新資訊：市場數據、競品、法規、新聞、股價等即時內容。",
         "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+    },
+    {
+        "name": "get_weather",
+        "description": "取得指定地點的即時天氣和今日預報。Aaron 問天氣時主動查，不需要等他要求。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"location": {"type": "string", "description": "地點，如 'Ho Chi Minh City' 或 'Taipei'"}},
+            "required": ["location"]
+        }
+    },
+    {
+        "name": "browse_url",
+        "description": "直接開啟網頁讀取內容。用於查競品網站、讀新聞原文、查政府法規、取得任何網址的詳細內容。",
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "完整網址，包含 https://"}},
+            "required": ["url"]
+        }
     },
     {
         "name": "send_email",
@@ -188,6 +232,18 @@ TOOLS = [
         "name": "list_reminders",
         "description": "列出所有待辦提醒事項。",
         "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "computer_use_task",
+        "description": "讓 Aaron 的 Mac 電腦實際執行任務：開瀏覽器、填寫表單、在網站上操作、訂票、發社群文章等。Aaron 說「幫我去做」「到網站上」「直接幫我」時使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "要執行的任務描述，越詳細越好"},
+                "url": {"type": "string", "description": "要前往的網址（選填）"}
+            },
+            "required": ["task"]
+        }
     }
 ]
 
@@ -205,6 +261,110 @@ async def brave_search(query: str) -> str:
         if not results:
             return "沒找到相關結果"
         return "\n\n".join([f"・{r.get('title','')}\n  {r.get('description','')}\n  {r.get('url','')}" for r in results[:5]])
+
+
+async def get_weather_impl(location: str) -> str:
+    """Open-Meteo 天氣（完全免費，無需 API key）"""
+    try:
+        async with httpx.AsyncClient() as client:
+            geo = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": location, "count": 1, "language": "zh"},
+                timeout=10
+            )
+            geo_data = geo.json()
+            if not geo_data.get("results"):
+                return f"找不到 {location} 的位置"
+            r = geo_data["results"][0]
+            lat, lon = r["latitude"], r["longitude"]
+            name = r.get("name", location)
+
+            weather = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat, "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,apparent_temperature",
+                    "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                    "timezone": "auto",
+                    "forecast_days": 1
+                },
+                timeout=10
+            )
+            w = weather.json()
+            cur = w.get("current", {})
+            daily = w.get("daily", {})
+
+            wcode_map = {
+                0: "晴天", 1: "大致晴朗", 2: "局部多雲", 3: "多雲",
+                45: "有霧", 48: "結冰霧", 51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+                61: "小雨", 63: "中雨", 65: "大雨", 71: "小雪", 80: "陣雨",
+                95: "雷雨", 96: "冰雹雷雨", 99: "大雷雨"
+            }
+            wdesc = wcode_map.get(cur.get("weather_code", 0), "天氣未知")
+
+            max_t = daily.get("temperature_2m_max", ["-"])[0]
+            min_t = daily.get("temperature_2m_min", ["-"])[0]
+            rain_prob = daily.get("precipitation_probability_max", ["-"])[0]
+
+            return (
+                f"{name}：{wdesc}\n"
+                f"氣溫 {cur.get('temperature_2m', '-')}°C（體感 {cur.get('apparent_temperature', '-')}°C）\n"
+                f"濕度 {cur.get('relative_humidity_2m', '-')}%　風速 {cur.get('wind_speed_10m', '-')} km/h\n"
+                f"今日最高 {max_t}°C / 最低 {min_t}°C　降雨機率 {rain_prob}%"
+            )
+    except Exception as e:
+        return f"{location} 天氣查詢失敗：{str(e)}"
+
+
+async def browse_url_impl(url: str) -> str:
+    """用 httpx + BeautifulSoup 讀取網頁內容"""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0"},
+                timeout=15
+            )
+            if resp.status_code != 200:
+                return f"無法存取 {url}（HTTP {resp.status_code}）"
+
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(resp.text, "lxml")
+                for tag in soup(["script", "style", "nav", "footer", "header", "aside", "iframe", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator="\n", strip=True)
+                lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 15]
+                return "\n".join(lines[:80])[:3000]
+            except ImportError:
+                return resp.text[:2000]
+    except Exception as e:
+        return f"網頁存取失敗：{str(e)}"
+
+
+async def computer_use_task_impl(task: str, url: str = "") -> str:
+    """呼叫 Mac 本地 Computer Use 服務"""
+    if not MAC_SERVICE_URL:
+        return "Mac Computer Use 服務未設定。請先在 Aaron 的 Mac 上啟動 mac-computer-use.py，並設定 MAC_SERVICE_URL 環境變數。"
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {"task": task}
+            if url:
+                payload["url"] = url
+            resp = await client.post(
+                f"{MAC_SERVICE_URL}/execute",
+                json=payload,
+                timeout=120  # Computer Use 可能需要一段時間
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                return result.get("result", "執行完成（無詳細結果）")
+            else:
+                return f"Mac 服務回應錯誤（HTTP {resp.status_code}）：{resp.text[:200]}"
+    except httpx.ConnectError:
+        return "無法連接到 Mac 服務，請確認 mac-computer-use.py 正在運行且 MAC_SERVICE_URL 正確"
+    except Exception as e:
+        return f"執行失敗：{str(e)}"
 
 
 def do_send_email(to: str, subject: str, body: str, confirmed: bool) -> str:
@@ -240,7 +400,7 @@ def do_read_emails(count: int = 5) -> str:
             _, msg_data = mail.fetch(num, "(RFC822)")
             msg = email_lib.message_from_bytes(msg_data[0][1])
             subject_raw = decode_header(msg["Subject"] or "")[0]
-            subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else subject_raw[0]
+            subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else (subject_raw[0] or "")
             sender = msg.get("From", "")
             date = msg.get("Date", "")
             body = ""
@@ -277,9 +437,67 @@ def do_list_reminders() -> str:
     return "待辦提醒清單：\n" + "\n".join(lines)
 
 
+def check_important_unread_emails() -> list[dict]:
+    """掃 Gmail 未讀重要郵件，回傳尚未推播過的"""
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        return []
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        mail.select("INBOX")
+        _, data = mail.search(None, "UNSEEN")
+        ids = data[0].split()
+        if not ids:
+            mail.logout()
+            return []
+
+        important = []
+        for num in ids[-30:]:  # 最多檢查最新 30 封未讀
+            _, msg_data = mail.fetch(num, "(RFC822)")
+            msg = email_lib.message_from_bytes(msg_data[0][1])
+
+            subject_raw = decode_header(msg["Subject"] or "")[0]
+            subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else (subject_raw[0] or "")
+            email_id = msg.get("Message-ID", str(num))
+
+            if email_id in seen_email_ids:
+                continue
+
+            is_important = any(kw.lower() in subject.lower() for kw in IMPORTANT_EMAIL_KEYWORDS)
+            if not is_important:
+                continue
+
+            sender = msg.get("From", "")
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
+                        break
+            else:
+                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
+
+            important.append({
+                "id": email_id,
+                "from": sender[:60],
+                "subject": subject[:80],
+                "preview": body
+            })
+
+        mail.logout()
+        return important
+    except Exception as e:
+        print(f"[proactive_check] email error: {e}")
+        return []
+
+
 async def process_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "web_search":
         return await brave_search(tool_input["query"])
+    elif tool_name == "get_weather":
+        return await get_weather_impl(tool_input["location"])
+    elif tool_name == "browse_url":
+        return await browse_url_impl(tool_input["url"])
     elif tool_name == "send_email":
         return do_send_email(tool_input["to"], tool_input["subject"], tool_input["body"], tool_input.get("confirmed", False))
     elif tool_name == "read_emails":
@@ -288,6 +506,8 @@ async def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return do_set_reminder(tool_input["text"], tool_input.get("time_hint", ""))
     elif tool_name == "list_reminders":
         return do_list_reminders()
+    elif tool_name == "computer_use_task":
+        return await computer_use_task_impl(tool_input["task"], tool_input.get("url", ""))
     return "未知工具"
 
 
@@ -446,7 +666,6 @@ async def webhook(request: Request):
         reply_token = event["replyToken"]
         msg_id = event["message"]["id"]
 
-        # 記錄 user_id 供主動推播用
         if user_id not in known_user_ids:
             known_user_ids.append(user_id)
 
@@ -472,8 +691,8 @@ async def webhook(request: Request):
                 video_data = await download_line_media(msg_id)
                 if video_data:
                     transcription, frames = await extract_video_data(video_data)
-                    msg = f"影片語音：{transcription}\n請分析影片內容。" if transcription else "請分析影片畫面內容。"
-                    reply = await chat_with_claude(user_id, msg, media_images=frames if frames else None)
+                    msg_text = f"影片語音：{transcription}\n請分析影片內容。" if transcription else "請分析影片畫面內容。"
+                    reply = await chat_with_claude(user_id, msg_text, media_images=frames if frames else None)
                     log_label = f"（影片）{transcription[:100]}"
                 else:
                     reply = "影片下載失敗"
@@ -497,7 +716,7 @@ async def webhook(request: Request):
                     await send_line_reply(reply_token, "對話記錄已清除")
                     continue
 
-                if user_text.strip() == "/提醒" or user_text.strip() == "/reminders":
+                if user_text.strip() in ("/提醒", "/reminders"):
                     reply = do_list_reminders()
                     await send_line_reply(reply_token, reply)
                     continue
@@ -531,15 +750,17 @@ async def health():
         "groq_ready": bool(GROQ_API_KEY),
         "ffmpeg_ready": shutil.which("ffmpeg") is not None,
         "gmail_ready": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
+        "mac_service_ready": bool(MAC_SERVICE_URL),
         "known_users": len(known_user_ids),
         "reminders": len(reminders),
+        "seen_email_ids": len(seen_email_ids),
         "daily_log_count": len(daily_log)
     }
 
 
 @app.get("/morning-briefing")
 async def morning_briefing(secret: str = ""):
-    """每日晨報：主動推播給所有已知用戶"""
+    """每日晨報：天氣 + 重要郵件 + 待辦提醒，主動推播給所有已知用戶"""
     if not SYNC_SECRET or secret != SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
     if not known_user_ids:
@@ -548,11 +769,40 @@ async def morning_briefing(secret: str = ""):
     today = datetime.now().strftime("%Y-%m-%d %A")
     reminder_text = do_list_reminders()
 
-    briefing_prompt = f"今天是 {today}。請用 3-5 行給 Aaron 一個晨報：今日重點提醒 + 最近待辦清單中最緊急的事項。簡潔，像朋友發訊息。\n\n{reminder_text}"
+    # 並行取得兩地天氣
+    hcmc_weather, taipei_weather = await asyncio.gather(
+        get_weather_impl("Ho Chi Minh City"),
+        get_weather_impl("Taipei")
+    )
+
+    # 讀最新郵件
+    email_summary = do_read_emails(3)
+
+    briefing_prompt = f"""今天是 {today}。
+
+胡志明市天氣：
+{hcmc_weather}
+
+台北天氣：
+{taipei_weather}
+
+最新郵件（最近3封）：
+{email_summary}
+
+待辦提醒：
+{reminder_text}
+
+請給 Aaron 一個晨報，格式：
+・今日天氣（兩個城市，一行搞定）
+・最重要的 1-2 個待辦
+・郵件有沒有重要的（沒有就不用寫）
+・一句今日重點提醒
+
+要求：繁體中文，像朋友傳訊息，不用 Markdown，條列用「・」，總長度不超過15行。"""
 
     response = await anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=500,
+        max_tokens=600,
         system=build_system_prompt(),
         messages=[{"role": "user", "content": briefing_prompt}]
     )
@@ -564,6 +814,33 @@ async def morning_briefing(secret: str = ""):
         sent += 1
 
     return {"status": "sent", "recipients": sent, "briefing": briefing}
+
+
+@app.get("/proactive-check")
+async def proactive_check(secret: str = ""):
+    """主動監測：掃 Gmail 未讀重要郵件，有的話推播到 LINE"""
+    if not SYNC_SECRET or secret != SYNC_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if not known_user_ids:
+        return {"status": "no_users", "pushed": 0}
+
+    important_emails = check_important_unread_emails()
+    pushed = 0
+
+    for em in important_emails:
+        if em["id"] not in seen_email_ids:
+            msg = (
+                f"重要郵件提醒\n\n"
+                f"寄件人：{em['from']}\n"
+                f"主旨：{em['subject']}\n\n"
+                f"{em['preview'][:200]}"
+            )
+            for uid in known_user_ids:
+                await send_line_push(uid, msg)
+            seen_email_ids.add(em["id"])
+            pushed += 1
+
+    return {"status": "ok", "checked": len(important_emails), "pushed": pushed}
 
 
 @app.get("/daily-summary")
