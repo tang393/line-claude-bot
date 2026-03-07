@@ -49,6 +49,7 @@ MEMORY_PATH   = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
 LINE_LOG_PATH = Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
 DATA_PATH     = Path("/tmp/jarvis_data.json")
 KB_PATH       = Path("/tmp/jarvis_kb.json")
+EXPENSE_PATH  = Path("/tmp/jarvis_expenses.json")
 MAX_HISTORY   = 8
 
 IMPORTANT_EMAIL_KEYWORDS = [
@@ -59,24 +60,25 @@ IMPORTANT_EMAIL_KEYWORDS = [
 
 # ── 持久化狀態 ─────────────────────────────────────────
 
-def load_data() -> dict:
-    # 優先本地，沒有就從 Google Drive 拉
+def _load_json(path: Path, gdrive_name: str, default: dict) -> dict:
     try:
-        if DATA_PATH.exists():
-            return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         pass
-    # 嘗試從 Google Drive 恢復
     try:
-        cloud = gdrive_download("jarvis_data.json")
+        cloud = gdrive_download(gdrive_name)
         if cloud:
-            DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-            DATA_PATH.write_text(cloud, encoding="utf-8")
-            print("[startup] 從 Google Drive 恢復 jarvis_data.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(cloud, encoding="utf-8")
             return json.loads(cloud)
     except Exception:
         pass
-    return {"known_user_ids": [], "reminders": [], "seen_email_ids": []}
+    return default.copy()
+
+def load_data() -> dict:
+    return _load_json(DATA_PATH, "jarvis_data.json",
+                      {"known_user_ids": [], "reminders": [], "seen_email_ids": [], "countdowns": []})
 
 def save_data():
     try:
@@ -84,7 +86,8 @@ def save_data():
         payload = {
             "known_user_ids": known_user_ids,
             "reminders": reminders,
-            "seen_email_ids": list(seen_email_ids)
+            "seen_email_ids": list(seen_email_ids),
+            "countdowns": countdowns
         }
         content = json.dumps(payload, ensure_ascii=False, indent=2)
         DATA_PATH.write_text(content, encoding="utf-8")
@@ -93,21 +96,11 @@ def save_data():
         print(f"[save_data] 失敗：{e}")
 
 def load_kb() -> dict:
-    try:
-        if KB_PATH.exists():
-            return json.loads(KB_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    try:
-        cloud = gdrive_download("jarvis_kb.json")
-        if cloud:
-            KB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            KB_PATH.write_text(cloud, encoding="utf-8")
-            print("[startup] 從 Google Drive 恢復 jarvis_kb.json")
-            return json.loads(cloud)
-    except Exception:
-        pass
-    return {"clinic": [], "herbalife": [], "contacts": [], "general": []}
+    return _load_json(KB_PATH, "jarvis_kb.json",
+                      {"clinic": [], "herbalife": [], "contacts": [], "general": []})
+
+def load_expenses() -> list:
+    return _load_json(EXPENSE_PATH, "jarvis_expenses.json", {"items": []}).get("items", [])
 
 def save_kb():
     try:
@@ -118,6 +111,15 @@ def save_kb():
     except Exception as e:
         print(f"[save_kb] 失敗：{e}")
 
+def save_expenses():
+    try:
+        EXPENSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps({"items": expenses}, ensure_ascii=False, indent=2)
+        EXPENSE_PATH.write_text(content, encoding="utf-8")
+        gdrive_upload("jarvis_expenses.json", content)
+    except Exception as e:
+        print(f"[save_expenses] 失敗：{e}")
+
 _data = load_data()
 
 # ── 狀態 ──────────────────────────────────────────────
@@ -126,8 +128,11 @@ daily_log: list = []
 known_user_ids: list = _data.get("known_user_ids", [])
 reminders: list = _data.get("reminders", [])
 seen_email_ids: set = set(_data.get("seen_email_ids", []))
+countdowns: list = _data.get("countdowns", [])
 knowledge_base: dict = load_kb()
+expenses: list = load_expenses()
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+_current_user_id: str = ""
 
 # ── 記憶 ──────────────────────────────────────────────
 
@@ -194,8 +199,10 @@ def build_system_prompt() -> str:
 {memory}
 
 # 工具使用原則
-需要最新資訊→web_search，天氣→get_weather，幣別→convert_currency，行程→get_calendar/add_calendar_event，郵件→read_emails/send_email，記事→set_reminder/delete_reminder/list_reminders，知識庫→search_knowledge_base/add_to_knowledge_base，網頁→browse_url，Mac操作→computer_use_task
+需要最新資訊→web_search，天氣→get_weather，幣別→convert_currency，行程→get_calendar/add_calendar_event，郵件→read_emails/send_email，記事→set_reminder/delete_reminder/list_reminders，定時推播→timed_reminder，記帳→add_expense，帳目→expense_report，倒計時→add_countdown，知識庫→search_knowledge_base/add_to_knowledge_base，網頁→browse_url，Mac操作→computer_use_task
 不確定就搜，別說「我不知道」。一次用對的工具，不要重複呼叫。
+「X點提醒我」「X分鐘後提醒」→用 timed_reminder（會到時推播），不是 set_reminder（只是存清單）。
+「花了」「買了」「付了」→用 add_expense 自動記帳。金額大的預設 VND，小的預設 TWD。
 
 # 工作流程
 收到任務 → 判斷需要哪些工具 → 先執行工具 → 整合結果直接給答案/成品
@@ -375,6 +382,56 @@ TOOLS = [
                 "index": {"type": "integer", "description": "待辦編號（從1開始）"}
             },
             "required": ["index"]
+        }
+    },
+    {
+        "name": "timed_reminder",
+        "description": "設定定時提醒，到時間會主動推播 LINE 訊息。Aaron 說「3點提醒我」「明天早上提醒」「30分鐘後提醒」時使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "提醒內容"},
+                "remind_at": {"type": "string", "description": "提醒時間，格式 YYYY-MM-DDTHH:MM（越南時區）"},
+                "delay_minutes": {"type": "integer", "description": "幾分鐘後提醒（跟 remind_at 二選一）"}
+            },
+            "required": ["text"]
+        }
+    },
+    {
+        "name": "add_expense",
+        "description": "記帳。Aaron 說「花了」「買了」「付了」「午餐XXX」「車費XXX」時使用。自動判斷幣別（越南盾/台幣/美金）。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "number", "description": "金額"},
+                "currency": {"type": "string", "description": "幣別：VND/TWD/USD"},
+                "category": {"type": "string", "description": "分類：food/transport/business/medical/personal/other"},
+                "note": {"type": "string", "description": "備註"}
+            },
+            "required": ["amount", "currency", "category", "note"]
+        }
+    },
+    {
+        "name": "expense_report",
+        "description": "查看記帳報表。Aaron 問「這個月花多少」「帳目」「支出」時使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "查幾天內的帳，預設30", "default": 30}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "add_countdown",
+        "description": "新增倒計時目標。重要日期的倒數（開幕、活動、截止日）。每天晨報會自動顯示。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "事件名稱"},
+                "target_date": {"type": "string", "description": "目標日期，格式 YYYY-MM-DD"}
+            },
+            "required": ["title", "target_date"]
         }
     }
 ]
@@ -730,6 +787,103 @@ def do_delete_reminder(index: int) -> str:
     return f"已完成/刪除：{removed['text']}"
 
 
+async def do_timed_reminder(user_id: str, text: str, remind_at: str = "", delay_minutes: int = 0) -> str:
+    """設定定時提醒，到時間主動推播"""
+    try:
+        if delay_minutes > 0:
+            fire_time = datetime.now() + timedelta(minutes=delay_minutes)
+            time_desc = f"{delay_minutes} 分鐘後"
+        elif remind_at:
+            fire_time = datetime.fromisoformat(remind_at)
+            time_desc = fire_time.strftime("%m/%d %H:%M")
+        else:
+            return "請指定提醒時間（remind_at 或 delay_minutes）"
+
+        async def _fire():
+            await send_line_push(user_id, f"定時提醒\n\n{text}")
+
+        scheduler.add_job(_fire, "date", run_date=fire_time)
+        return f"已設定！{time_desc} 會推播提醒你：{text}"
+    except Exception as e:
+        return f"設定失敗：{str(e)}"
+
+
+def do_add_expense(amount: float, currency: str, category: str, note: str) -> str:
+    currency = currency.upper()
+    cat_names = {"food": "飲食", "transport": "交通", "business": "商務", "medical": "醫療", "personal": "個人", "other": "其他"}
+    entry = {
+        "amount": amount,
+        "currency": currency,
+        "category": category,
+        "note": note,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    expenses.append(entry)
+    save_expenses()
+    amt_str = f"{amount:,.0f}" if amount >= 100 else f"{amount:,.2f}"
+    return f"已記帳：{amt_str} {currency}（{cat_names.get(category, category)}）{note}"
+
+
+def do_expense_report(days: int = 30) -> str:
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    recent = [e for e in expenses if e["date"] >= cutoff]
+    if not recent:
+        return f"最近 {days} 天沒有記帳紀錄"
+    cat_names = {"food": "飲食", "transport": "交通", "business": "商務", "medical": "醫療", "personal": "個人", "other": "其他"}
+    # 按幣別分組
+    by_currency = {}
+    by_category = {}
+    for e in recent:
+        cur = e["currency"]
+        cat = e["category"]
+        by_currency[cur] = by_currency.get(cur, 0) + e["amount"]
+        key = f"{cur}_{cat}"
+        by_category[key] = by_category.get(key, 0) + e["amount"]
+    lines = [f"最近 {days} 天支出報表（{len(recent)} 筆）", ""]
+    for cur, total in sorted(by_currency.items()):
+        lines.append(f"【{cur}】總計 {total:,.0f}")
+        for key, amt in sorted(by_category.items()):
+            if key.startswith(cur + "_"):
+                cat = key.split("_")[1]
+                lines.append(f"  {cat_names.get(cat, cat)}：{amt:,.0f}")
+    # 最近 5 筆明細
+    lines.append("")
+    lines.append("最近 5 筆：")
+    for e in recent[-5:]:
+        lines.append(f"  {e['date'][:10]} {e['amount']:,.0f} {e['currency']} {e['note']}")
+    return "\n".join(lines)
+
+
+def do_add_countdown(title: str, target_date: str) -> str:
+    try:
+        target = datetime.strptime(target_date, "%Y-%m-%d")
+        delta = (target - datetime.now()).days
+        countdowns.append({"title": title, "target_date": target_date})
+        save_data()
+        return f"已設定倒計時：{title}\n目標：{target_date}（還有 {delta} 天）\n每天晨報會自動顯示"
+    except ValueError:
+        return "日期格式錯誤，請用 YYYY-MM-DD"
+
+
+def get_countdown_text() -> str:
+    if not countdowns:
+        return ""
+    lines = []
+    for c in countdowns:
+        try:
+            target = datetime.strptime(c["target_date"], "%Y-%m-%d")
+            delta = (target - datetime.now()).days
+            if delta < 0:
+                lines.append(f"  {c['title']}：已過 {abs(delta)} 天")
+            elif delta == 0:
+                lines.append(f"  {c['title']}：就是今天！")
+            else:
+                lines.append(f"  {c['title']}：還有 {delta} 天")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
 def do_send_email(to: str, subject: str, body: str, confirmed: bool) -> str:
     if not confirmed:
         return f"等待確認。信件草稿：\n收件人：{to}\n主旨：{subject}\n\n{body}\n\n請回覆「確認發送」或「不用了」"
@@ -869,12 +1023,23 @@ async def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return await convert_currency_impl(tool_input["amount"], tool_input["from_currency"], tool_input["to_currency"])
     elif tool_name == "delete_reminder":
         return do_delete_reminder(tool_input["index"])
+    elif tool_name == "timed_reminder":
+        uid = _current_user_id or (known_user_ids[0] if known_user_ids else "")
+        return await do_timed_reminder(uid, tool_input["text"], tool_input.get("remind_at", ""), tool_input.get("delay_minutes", 0))
+    elif tool_name == "add_expense":
+        return do_add_expense(tool_input["amount"], tool_input["currency"], tool_input["category"], tool_input["note"])
+    elif tool_name == "expense_report":
+        return do_expense_report(tool_input.get("days", 30))
+    elif tool_name == "add_countdown":
+        return do_add_countdown(tool_input["title"], tool_input["target_date"])
     return "未知工具"
 
 
 # ── Claude API ────────────────────────────────────────
 
 async def chat_with_claude(user_id: str, user_message: str, media_images: list[bytes] | None = None) -> str:
+    global _current_user_id
+    _current_user_id = user_id
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
@@ -982,7 +1147,7 @@ def build_quick_reply():
             {"type": "action", "action": {"type": "message", "label": "查天氣", "text": "今天天氣"}},
             {"type": "action", "action": {"type": "message", "label": "查郵件", "text": "有沒有新郵件"}},
             {"type": "action", "action": {"type": "message", "label": "待辦清單", "text": "/提醒"}},
-            {"type": "action", "action": {"type": "message", "label": "VND匯率", "text": "100萬越南盾等於多少台幣"}},
+            {"type": "action", "action": {"type": "message", "label": "記帳報表", "text": "這個月花了多少"}},
         ]
     }
 
@@ -1088,6 +1253,7 @@ async def scheduled_morning_briefing():
     calendar_info = do_get_calendar(1)
     email_summary = do_read_emails(3)
     reminder_text = do_list_reminders()
+    countdown_text = get_countdown_text()
 
     briefing_prompt = f"""今天是 {today}。
 
@@ -1103,9 +1269,12 @@ async def scheduled_morning_briefing():
 
 待辦提醒：{reminder_text}
 
+倒計時：{countdown_text if countdown_text else '無'}
+
 請給 Aaron 一個晨報，格式：
 ・今日天氣（兩城市一行搞定）
 ・匯率（100萬越南盾 = ?台幣，一行搞定）
+・倒計時（有的話列出來）
 ・今天有沒有重要行程
 ・最重要的 1-2 個待辦
 ・郵件有重要的才寫，沒有就不寫
