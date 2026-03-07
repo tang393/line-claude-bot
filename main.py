@@ -43,6 +43,7 @@ SYNC_SECRET               = os.environ.get("PASSWORD", "")
 MAC_SERVICE_URL           = os.environ.get("MAC_SERVICE_URL", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # 完整 JSON 字串
 GOOGLE_CALENDAR_ID        = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+GOOGLE_DRIVE_FOLDER_ID    = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 MEMORY_PATH   = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
 LINE_LOG_PATH = Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
@@ -59,9 +60,20 @@ IMPORTANT_EMAIL_KEYWORDS = [
 # ── 持久化狀態 ─────────────────────────────────────────
 
 def load_data() -> dict:
+    # 優先本地，沒有就從 Google Drive 拉
     try:
         if DATA_PATH.exists():
             return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    # 嘗試從 Google Drive 恢復
+    try:
+        cloud = gdrive_download("jarvis_data.json")
+        if cloud:
+            DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DATA_PATH.write_text(cloud, encoding="utf-8")
+            print("[startup] 從 Google Drive 恢復 jarvis_data.json")
+            return json.loads(cloud)
     except Exception:
         pass
     return {"known_user_ids": [], "reminders": [], "seen_email_ids": []}
@@ -74,7 +86,9 @@ def save_data():
             "reminders": reminders,
             "seen_email_ids": list(seen_email_ids)
         }
-        DATA_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+        DATA_PATH.write_text(content, encoding="utf-8")
+        gdrive_upload("jarvis_data.json", content)
     except Exception as e:
         print(f"[save_data] 失敗：{e}")
 
@@ -84,12 +98,23 @@ def load_kb() -> dict:
             return json.loads(KB_PATH.read_text(encoding="utf-8"))
     except Exception:
         pass
+    try:
+        cloud = gdrive_download("jarvis_kb.json")
+        if cloud:
+            KB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            KB_PATH.write_text(cloud, encoding="utf-8")
+            print("[startup] 從 Google Drive 恢復 jarvis_kb.json")
+            return json.loads(cloud)
+    except Exception:
+        pass
     return {"clinic": [], "herbalife": [], "contacts": [], "general": []}
 
 def save_kb():
     try:
         KB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        KB_PATH.write_text(json.dumps(knowledge_base, ensure_ascii=False, indent=2), encoding="utf-8")
+        content = json.dumps(knowledge_base, ensure_ascii=False, indent=2)
+        KB_PATH.write_text(content, encoding="utf-8")
+        gdrive_upload("jarvis_kb.json", content)
     except Exception as e:
         print(f"[save_kb] 失敗：{e}")
 
@@ -136,6 +161,12 @@ def save_to_memory(content: str) -> bool:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         with open(LINE_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"\n## {ts}\n{content}\n")
+        # 同步到 Google Drive
+        try:
+            full_content = LINE_LOG_PATH.read_text(encoding="utf-8")
+            gdrive_upload("line-conversations.md", full_content)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -475,24 +506,88 @@ async def browse_url_impl(url: str) -> str:
         return f"網頁存取失敗：{str(e)}"
 
 
-def get_google_calendar_service():
-    """建立 Google Calendar 服務（使用 Service Account JSON）"""
+def get_google_service(api: str, version: str, scopes: list):
+    """通用 Google API 服務建立"""
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-        import json as json_lib
-
-        creds_info = json_lib.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        import json as _json
         creds = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/calendar"]
+            _json.loads(GOOGLE_SERVICE_ACCOUNT_JSON), scopes=scopes
         )
-        return build("calendar", "v3", credentials=creds)
+        return build(api, version, credentials=creds)
     except Exception as e:
-        print(f"[Google Calendar] 初始化失敗：{e}")
+        print(f"[Google {api}] 初始化失敗：{e}")
         return None
+
+
+# ── Google Drive 同步 ─────────────────────────────────
+
+def gdrive_get_file_id(service, filename: str) -> str | None:
+    """在 JARVIS-AI 資料夾中找指定檔案的 ID"""
+    try:
+        results = service.files().list(
+            q=f"name='{filename}' and '{GOOGLE_DRIVE_FOLDER_ID}' in parents and trashed=false",
+            fields="files(id, name)"
+        ).execute()
+        files = results.get("files", [])
+        return files[0]["id"] if files else None
+    except Exception:
+        return None
+
+
+def gdrive_upload(filename: str, content: str):
+    """上傳或更新檔案到 Google Drive JARVIS-AI 資料夾"""
+    if not GOOGLE_DRIVE_FOLDER_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return
+    try:
+        from googleapiclient.http import MediaInMemoryUpload
+        service = get_google_service(
+            "drive", "v3",
+            ["https://www.googleapis.com/auth/drive"]
+        )
+        if not service:
+            return
+        media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="text/plain")
+        file_id = gdrive_get_file_id(service, filename)
+        if file_id:
+            service.files().update(fileId=file_id, media_body=media).execute()
+        else:
+            service.files().create(
+                body={"name": filename, "parents": [GOOGLE_DRIVE_FOLDER_ID]},
+                media_body=media
+            ).execute()
+        print(f"[GDrive] 已同步：{filename}")
+    except Exception as e:
+        print(f"[GDrive] 上傳失敗 {filename}：{e}")
+
+
+def gdrive_download(filename: str) -> str | None:
+    """從 Google Drive 下載檔案內容"""
+    if not GOOGLE_DRIVE_FOLDER_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        service = get_google_service(
+            "drive", "v3",
+            ["https://www.googleapis.com/auth/drive"]
+        )
+        if not service:
+            return None
+        file_id = gdrive_get_file_id(service, filename)
+        if not file_id:
+            return None
+        content = service.files().get_media(fileId=file_id).execute()
+        return content.decode("utf-8")
+    except Exception as e:
+        print(f"[GDrive] 下載失敗 {filename}：{e}")
+        return None
+
+
+def get_google_calendar_service():
+    """建立 Google Calendar 服務"""
+    return get_google_service("calendar", "v3", ["https://www.googleapis.com/auth/calendar"])
 
 
 def do_get_calendar(days: int = 7) -> str:
@@ -1129,8 +1224,20 @@ async def startup():
     scheduler.add_job(scheduled_morning_briefing, CronTrigger(hour=8, minute=0))
     scheduler.add_job(scheduled_evening_summary, CronTrigger(hour=22, minute=0))
     scheduler.add_job(scheduled_proactive_check, "interval", minutes=30)
+    # 恢復對話記錄
+    if not LINE_LOG_PATH.exists():
+        try:
+            cloud_log = gdrive_download("line-conversations.md")
+            if cloud_log:
+                LINE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                LINE_LOG_PATH.write_text(cloud_log, encoding="utf-8")
+                print("[startup] 從 Google Drive 恢復 line-conversations.md")
+        except Exception:
+            pass
+
     scheduler.start()
-    print(f"[startup] JARVIS 啟動完成，已知用戶：{len(known_user_ids)} 人，知識庫：{sum(len(v) for v in knowledge_base.values())} 筆")
+    gdrive_status = "已連接" if GOOGLE_DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON else "未設定"
+    print(f"[startup] JARVIS 啟動完成，已知用戶：{len(known_user_ids)} 人，知識庫：{sum(len(v) for v in knowledge_base.values())} 筆，GDrive：{gdrive_status}")
 
 
 if __name__ == "__main__":
