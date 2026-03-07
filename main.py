@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LINE Claude Bot - Aaron 的全知全能私人助理
-工具：網路搜尋、Gmail 收發、天氣、網頁瀏覽、提醒事項、圖片/語音/影片分析
+LINE Claude Bot - Aaron 的全知全能私人助理 JARVIS
+工具：網路搜尋、Gmail 收發、天氣、網頁瀏覽、Google Calendar、知識庫、語音/圖片/影片
 主動功能：重要郵件推播、每日晨報（含天氣）、晚報
 """
 
@@ -20,7 +20,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import anthropic
@@ -32,22 +32,24 @@ from apscheduler.triggers.cron import CronTrigger
 app = FastAPI()
 
 # ── 環境變數 ──────────────────────────────────────────
-ANTHROPIC_API_KEY        = os.environ.get("ANTHROPIC_API_KEY", "")
-LINE_CHANNEL_SECRET      = os.environ.get("LINE_CHANNEL_SECRET", "")
-LINE_CHANNEL_ACCESS_TOKEN= os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-BRAVE_API_KEY            = os.environ.get("BRAVE_API_KEY", "")
-GROQ_API_KEY             = os.environ.get("GROQ_API_KEY", "")
-GMAIL_ADDRESS            = os.environ.get("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD       = os.environ.get("GMAIL_APP_PASSWORD", "")
-SYNC_SECRET              = os.environ.get("PASSWORD", "")
-MAC_SERVICE_URL          = os.environ.get("MAC_SERVICE_URL", "")
+ANTHROPIC_API_KEY         = os.environ.get("ANTHROPIC_API_KEY", "")
+LINE_CHANNEL_SECRET       = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+BRAVE_API_KEY             = os.environ.get("BRAVE_API_KEY", "")
+GROQ_API_KEY              = os.environ.get("GROQ_API_KEY", "")
+GMAIL_ADDRESS             = os.environ.get("GMAIL_ADDRESS", "")
+GMAIL_APP_PASSWORD        = os.environ.get("GMAIL_APP_PASSWORD", "")
+SYNC_SECRET               = os.environ.get("PASSWORD", "")
+MAC_SERVICE_URL           = os.environ.get("MAC_SERVICE_URL", "")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")  # 完整 JSON 字串
+GOOGLE_CALENDAR_ID        = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
 
-MEMORY_PATH  = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
-LINE_LOG_PATH= Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
-DATA_PATH    = Path("/tmp/jarvis_data.json")   # 持久化：user IDs、reminders
-MAX_HISTORY  = 20
+MEMORY_PATH   = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
+LINE_LOG_PATH = Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
+DATA_PATH     = Path("/tmp/jarvis_data.json")
+KB_PATH       = Path("/tmp/jarvis_kb.json")
+MAX_HISTORY   = 20
 
-# 重要郵件關鍵字
 IMPORTANT_EMAIL_KEYWORDS = [
     "合約", "協議", "緊急", "urgent", "important", "付款", "帳單", "invoice",
     "overdue", "逾期", "截止", "deadline", "簽約", "URGENT", "ACTION REQUIRED",
@@ -76,6 +78,21 @@ def save_data():
     except Exception as e:
         print(f"[save_data] 失敗：{e}")
 
+def load_kb() -> dict:
+    try:
+        if KB_PATH.exists():
+            return json.loads(KB_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"clinic": [], "herbalife": [], "contacts": [], "general": []}
+
+def save_kb():
+    try:
+        KB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        KB_PATH.write_text(json.dumps(knowledge_base, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[save_kb] 失敗：{e}")
+
 _data = load_data()
 
 # ── 狀態 ──────────────────────────────────────────────
@@ -84,6 +101,7 @@ daily_log: list = []
 known_user_ids: list = _data.get("known_user_ids", [])
 reminders: list = _data.get("reminders", [])
 seen_email_ids: set = set(_data.get("seen_email_ids", []))
+knowledge_base: dict = load_kb()
 anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── 記憶 ──────────────────────────────────────────────
@@ -102,6 +120,14 @@ def get_memory() -> str:
     if reminders:
         reminder_text = "\n".join([f"・{r['text']}（設定於 {r['created']}）" for r in reminders])
         content += f"\n\n# 待辦提醒\n{reminder_text}"
+    # 附上知識庫摘要
+    kb_summary = []
+    for cat, entries in knowledge_base.items():
+        if entries:
+            cat_names = {"clinic": "診所SOP", "herbalife": "賀寶芙", "contacts": "人脈聯絡", "general": "通用知識"}
+            kb_summary.append(f"・{cat_names.get(cat, cat)}：{len(entries)} 筆")
+    if kb_summary:
+        content += f"\n\n# 知識庫（已有資料）\n" + "\n".join(kb_summary) + "\n（用 search_knowledge_base 工具查詢詳細內容）"
     return content
 
 def save_to_memory(content: str) -> bool:
@@ -119,30 +145,43 @@ def save_to_memory(content: str) -> bool:
 def build_system_prompt() -> str:
     memory = get_memory()
     today  = datetime.now().strftime("%Y-%m-%d %A")
-    gmail_status = "已連接（可收發信）" if GMAIL_ADDRESS else "未設定"
-    mac_status = "已連接（可控制瀏覽器）" if MAC_SERVICE_URL else "未設定"
+    gmail_status    = "已連接（可收發信）" if GMAIL_ADDRESS else "未設定"
+    mac_status      = "已連接（可控制瀏覽器）" if MAC_SERVICE_URL else "未設定"
+    gcal_status     = "已連接" if GOOGLE_SERVICE_ACCOUNT_JSON else "未設定（需要 Google 憑證）"
 
     return f"""# 身份
-你是 Aaron（湯凱賀）的私人全知全能助理 JARVIS，透過 LINE 24/7 待命。
+你是 JARVIS，Aaron（湯凱賀/凱總）的私人全知全能執行管家，透過 LINE 24/7 待命。
 核心職責：商業決策支援、越南診所管理、賀寶芙團隊、日常事務處理。
+自稱「J」或「JARVIS」，稱 Aaron 為「凱總」。
+
+# 語言規則
+・預設用繁體中文
+・Aaron 提到越南客戶、越南員工、或說「越南文」「用越文」時，切換越南文回覆
+・同一則訊息如需要，可中越文混用
 
 # 用戶背景
 {memory}
 
-# 強制工具使用規則（這是最高優先指令）
-
-以下情況你必須先呼叫工具，不許直接回答：
+# 強制工具使用規則（最高優先指令）
 
 【一定要呼叫 web_search 的情況】
 ・任何涉及「最新」「現在」「今天」「近期」「最近」的資訊
-・市場數據、競品、法規、新聞、股價、匯率
+・市場數據、競品、法規、新聞、股價、匯率、越南法規
 ・你不確定是否為最新資訊的任何問題
-・Aaron 問「...怎麼樣」「...有沒有」「...是多少」這類需要確認的問題
+・Aaron 問「...怎麼樣」「...有沒有」「...是多少」需要確認的問題
 ・禁止說「我不知道最新情況」然後不搜尋，直接搜！
 
 【一定要呼叫 get_weather 的情況】
 ・任何提到天氣、氣溫、下雨、濕度、颱風
-・每天早報必查胡志明市和台北兩個城市
+
+【一定要呼叫 search_knowledge_base 的情況】
+・問到診所 SOP、療程、價格、服務流程
+・問到賀寶芙產品、獎銜制度、活動、佣金
+・問到任何人名、聯絡資訊
+・先搜知識庫，再決定要不要補充搜尋網路
+
+【一定要呼叫 get_calendar 的情況】
+・問到「有沒有行程」「明天幾點」「這週安排」「日程表」「行事曆」
 
 【一定要呼叫 read_emails 的情況】
 ・Aaron 說「信」「郵件」「mail」「有沒有人聯絡我」
@@ -156,46 +195,52 @@ get_weather：查天氣（預設查胡志明市+台北）
 browse_url：直接讀取指定網址內容
 send_email：代 Aaron 發郵件（發前須確認，除非 Aaron 說直接發）
 read_emails：讀 Gmail 最新郵件
-set_reminder：存提醒/待辦（存入永久清單）
+set_reminder：存提醒/待辦（永久保存）
 list_reminders：列出所有待辦
+get_calendar：查 Google Calendar 行程（狀態：{gcal_status}）
+add_calendar_event：新增 Google Calendar 行程（狀態：{gcal_status}）
+search_knowledge_base：搜尋知識庫（診所SOP/賀寶芙/人脈）
+add_to_knowledge_base：新增知識庫條目
 computer_use_task：讓 Mac 執行實際操作（狀態：{mac_status}）
 
 # 工作流程
 收到任務 → 判斷需要哪些工具 → 先執行工具 → 整合結果直接給答案/成品
-草稿類（合約、信件、文案）：直接給完整版
+草稿類：直接給完整版
 研究類：先搜尋，再給有數據支撐的結論
 待辦類：執行完回報結果
 
 # 溝通風格
-・繁體中文，像朋友傳訊息
+・繁體中文為主，必要時切換越南文
 ・絕對禁止：* ** # ` 等 Markdown 符號（LINE 顯示亂碼）
 ・條列用「・」
 ・不說「當然可以」「很好的問題」「我理解您的需求」
 ・直接說結論，原因放後面
+・能一句話講完就不要兩句
 
 # 自主 vs 先請示
-自主決定：研究分析、起草文件、搜尋、查天氣、瀏覽網頁
-先請示：發送郵件、對外聯繫、刪除/不可逆操作
+自主決定：研究分析、起草文件、搜尋、查天氣、瀏覽網頁、查行程
+先請示：發送郵件、新增/刪除行程、對外聯繫、刪除/不可逆操作
 嚴禁：「要用哪個方法？」「需要我做什麼？」——直接判斷並執行
 
 # 環境
 今天：{today}
 Gmail：{gmail_status}
+Google Calendar：{gcal_status}
 語音辨識：{'已啟用' if GROQ_API_KEY else '未啟用'}
 Mac 遠端：{mac_status}"""
 
 
-# ── 工具實作 ──────────────────────────────────────────
+# ── 工具清單 ──────────────────────────────────────────
 
 TOOLS = [
     {
         "name": "web_search",
-        "description": "搜尋網路最新資訊：市場數據、競品、法規、新聞、股價等即時內容。遇到任何需要最新資訊的問題必須呼叫此工具。",
+        "description": "搜尋網路最新資訊：市場數據、競品、法規、新聞、越南醫美市場、賀寶芙動態等。遇到需要最新資訊的問題必須呼叫此工具。",
         "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
     },
     {
         "name": "get_weather",
-        "description": "取得指定地點的即時天氣和今日預報。Aaron 問天氣時立刻查，不需要等他要求。",
+        "description": "取得指定地點的即時天氣和今日預報。Aaron 問天氣時立刻查。",
         "input_schema": {
             "type": "object",
             "properties": {"location": {"type": "string", "description": "地點，如 'Ho Chi Minh City' 或 'Taipei'"}},
@@ -204,7 +249,7 @@ TOOLS = [
     },
     {
         "name": "browse_url",
-        "description": "直接開啟網頁讀取內容。用於查競品網站、讀新聞原文、查政府法規、取得任何網址的詳細內容。",
+        "description": "直接開啟網頁讀取內容。用於查競品網站、讀新聞原文、查政府法規。",
         "input_schema": {
             "type": "object",
             "properties": {"url": {"type": "string", "description": "完整網址，包含 https://"}},
@@ -213,13 +258,13 @@ TOOLS = [
     },
     {
         "name": "send_email",
-        "description": "代 Aaron 發送 Gmail 郵件。發送前需先向 Aaron 確認內容，除非 Aaron 說直接發。",
+        "description": "代 Aaron 發送 Gmail 郵件。發送前需先確認，除非 Aaron 說直接發。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "收件人信箱"},
-                "subject": {"type": "string", "description": "主旨"},
-                "body": {"type": "string", "description": "信件內容"},
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
                 "confirmed": {"type": "boolean", "description": "Aaron 是否已確認要發送"}
             },
             "required": ["to", "subject", "body", "confirmed"]
@@ -227,21 +272,21 @@ TOOLS = [
     },
     {
         "name": "read_emails",
-        "description": "讀取 Aaron 的 Gmail 最新郵件，彙報重要內容。",
+        "description": "讀取 Aaron 的 Gmail 最新郵件。",
         "input_schema": {
             "type": "object",
-            "properties": {"count": {"type": "integer", "description": "讀幾封，預設5", "default": 5}},
+            "properties": {"count": {"type": "integer", "default": 5}},
             "required": []
         }
     },
     {
         "name": "set_reminder",
-        "description": "存入提醒/待辦事項。Aaron 說「記住」「提醒我」「待辦」「別忘了」時使用。資料會永久保存，重啟不消失。",
+        "description": "存入提醒/待辦事項，永久保存不消失。Aaron 說「記住」「提醒」「待辦」「別忘了」時使用。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "提醒內容"},
-                "time_hint": {"type": "string", "description": "時間提示（選填），如「明天」「下週一」「開幕前」"}
+                "text": {"type": "string"},
+                "time_hint": {"type": "string", "description": "時間提示（選填）"}
             },
             "required": ["text"]
         }
@@ -252,19 +297,72 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
-        "name": "computer_use_task",
-        "description": "讓 Aaron 的 Mac 電腦實際執行任務：開瀏覽器、填寫表單、在網站上操作、訂票、發社群文章等。Aaron 說「幫我去做」「到網站上」「直接幫我」時使用。",
+        "name": "get_calendar",
+        "description": "查詢 Google Calendar 行程。Aaron 問行程、日程、有沒有會議時使用。",
         "input_schema": {
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "要執行的任務描述，越詳細越好"},
-                "url": {"type": "string", "description": "要前往的網址（選填）"}
+                "days": {"type": "integer", "description": "查幾天的行程，預設 7", "default": 7}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "add_calendar_event",
+        "description": "在 Google Calendar 新增行程。需先告知 Aaron 再執行。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "行程標題"},
+                "start_datetime": {"type": "string", "description": "開始時間，格式 YYYY-MM-DDTHH:MM:SS"},
+                "end_datetime": {"type": "string", "description": "結束時間，格式 YYYY-MM-DDTHH:MM:SS"},
+                "description": {"type": "string", "description": "備註（選填）"},
+                "location": {"type": "string", "description": "地點（選填）"}
+            },
+            "required": ["title", "start_datetime", "end_datetime"]
+        }
+    },
+    {
+        "name": "search_knowledge_base",
+        "description": "搜尋本地知識庫。問到診所SOP/療程/價格、賀寶芙產品/制度、人名聯絡資訊時必須先呼叫此工具。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜尋關鍵字"},
+                "category": {"type": "string", "description": "分類（選填）：clinic / herbalife / contacts / general"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "add_to_knowledge_base",
+        "description": "新增條目到知識庫。Aaron 說「存入知識庫」「記到知識庫」時使用。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string", "description": "分類：clinic / herbalife / contacts / general"},
+                "title": {"type": "string", "description": "標題"},
+                "content": {"type": "string", "description": "內容"}
+            },
+            "required": ["category", "title", "content"]
+        }
+    },
+    {
+        "name": "computer_use_task",
+        "description": "讓 Aaron 的 Mac 電腦實際執行任務：開瀏覽器、填寫表單、操作網站等。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "url": {"type": "string", "description": "目標網址（選填）"}
             },
             "required": ["task"]
         }
     }
 ]
 
+
+# ── 工具實作 ──────────────────────────────────────────
 
 async def brave_search(query: str) -> str:
     if not BRAVE_API_KEY:
@@ -274,7 +372,7 @@ async def brave_search(query: str) -> str:
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers, params={"q": query, "count": 5}, timeout=10)
-            if resp.status_code == 429:
+            if resp.status_code in (429, 403):
                 return await duckduckgo_search(query)
             if resp.status_code != 200:
                 return await duckduckgo_search(query)
@@ -287,7 +385,6 @@ async def brave_search(query: str) -> str:
 
 
 async def duckduckgo_search(query: str) -> str:
-    """DuckDuckGo 備用搜尋（Brave 失敗時使用）"""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -328,26 +425,22 @@ async def get_weather_impl(location: str) -> str:
                     "latitude": lat, "longitude": lon,
                     "current": "temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,apparent_temperature",
                     "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                    "timezone": "auto",
-                    "forecast_days": 1
+                    "timezone": "auto", "forecast_days": 1
                 },
                 timeout=10
             )
             w = weather.json()
             cur = w.get("current", {})
             daily = w.get("daily", {})
-
             wcode_map = {
                 0: "晴天", 1: "大致晴朗", 2: "局部多雲", 3: "多雲",
-                45: "有霧", 48: "結冰霧", 51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
-                61: "小雨", 63: "中雨", 65: "大雨", 71: "小雪", 80: "陣雨",
-                95: "雷雨", 96: "冰雹雷雨", 99: "大雷雨"
+                45: "有霧", 51: "小毛毛雨", 53: "毛毛雨", 61: "小雨",
+                63: "中雨", 65: "大雨", 80: "陣雨", 95: "雷雨"
             }
             wdesc = wcode_map.get(cur.get("weather_code", 0), "天氣未知")
             max_t = daily.get("temperature_2m_max", ["-"])[0]
             min_t = daily.get("temperature_2m_min", ["-"])[0]
             rain_prob = daily.get("precipitation_probability_max", ["-"])[0]
-
             return (
                 f"{name}：{wdesc}\n"
                 f"氣溫 {cur.get('temperature_2m', '-')}°C（體感 {cur.get('apparent_temperature', '-')}°C）\n"
@@ -382,9 +475,123 @@ async def browse_url_impl(url: str) -> str:
         return f"網頁存取失敗：{str(e)}"
 
 
+def get_google_calendar_service():
+    """建立 Google Calendar 服務（使用 Service Account JSON）"""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        import json as json_lib
+
+        creds_info = json_lib.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+        return build("calendar", "v3", credentials=creds)
+    except Exception as e:
+        print(f"[Google Calendar] 初始化失敗：{e}")
+        return None
+
+
+def do_get_calendar(days: int = 7) -> str:
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return "Google Calendar 未設定。請提供 GOOGLE_SERVICE_ACCOUNT_JSON 和 GOOGLE_CALENDAR_ID 環境變數。"
+    try:
+        service = get_google_calendar_service()
+        if not service:
+            return "Google Calendar 連線失敗"
+        now = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=now, timeMax=end,
+            maxResults=20, singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+        events = events_result.get("items", [])
+        if not events:
+            return f"未來 {days} 天沒有行程"
+        lines = []
+        for e in events:
+            start = e["start"].get("dateTime", e["start"].get("date", ""))
+            if "T" in start:
+                dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                start_str = dt.strftime("%m/%d %H:%M")
+            else:
+                start_str = start
+            title = e.get("summary", "（無標題）")
+            loc = f"　地點：{e['location']}" if e.get("location") else ""
+            lines.append(f"・{start_str} {title}{loc}")
+        return f"未來 {days} 天行程：\n" + "\n".join(lines)
+    except Exception as e:
+        return f"查詢行程失敗：{str(e)}"
+
+
+def do_add_calendar_event(title: str, start_datetime: str, end_datetime: str,
+                           description: str = "", location: str = "") -> str:
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return "Google Calendar 未設定"
+    try:
+        service = get_google_calendar_service()
+        if not service:
+            return "Google Calendar 連線失敗"
+        event = {
+            "summary": title,
+            "start": {"dateTime": start_datetime, "timeZone": "Asia/Ho_Chi_Minh"},
+            "end": {"dateTime": end_datetime, "timeZone": "Asia/Ho_Chi_Minh"},
+        }
+        if description:
+            event["description"] = description
+        if location:
+            event["location"] = location
+        result = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+        return f"已新增行程：{title}\n時間：{start_datetime} ～ {end_datetime}"
+    except Exception as e:
+        return f"新增行程失敗：{str(e)}"
+
+
+def do_search_knowledge_base(query: str, category: str = "") -> str:
+    query_lower = query.lower()
+    results = []
+    cats = [category] if category and category in knowledge_base else list(knowledge_base.keys())
+    cat_names = {"clinic": "診所", "herbalife": "賀寶芙", "contacts": "人脈", "general": "通用"}
+
+    for cat in cats:
+        for entry in knowledge_base.get(cat, []):
+            title = entry.get("title", "")
+            content = entry.get("content", "")
+            if query_lower in title.lower() or query_lower in content.lower():
+                results.append(f"【{cat_names.get(cat, cat)}】{title}\n{content}")
+
+    if not results:
+        return f"知識庫中沒有找到「{query}」的相關資料。可以用 /kb 指令新增。"
+    return "\n\n---\n\n".join(results[:5])
+
+
+def do_add_to_knowledge_base(category: str, title: str, content: str) -> str:
+    if category not in knowledge_base:
+        knowledge_base[category] = []
+    entry = {
+        "title": title,
+        "content": content,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+    # 更新已有同名條目
+    for i, e in enumerate(knowledge_base[category]):
+        if e.get("title") == title:
+            knowledge_base[category][i] = entry
+            save_kb()
+            return f"已更新知識庫【{category}】：{title}"
+    knowledge_base[category].append(entry)
+    save_kb()
+    return f"已新增到知識庫【{category}】：{title}"
+
+
 async def computer_use_task_impl(task: str, url: str = "") -> str:
     if not MAC_SERVICE_URL:
-        return "Mac Computer Use 服務未設定。請先在 Aaron 的 Mac 上啟動 mac-computer-use.py，並設定 MAC_SERVICE_URL 環境變數。"
+        return "Mac Computer Use 服務未設定。"
     try:
         async with httpx.AsyncClient() as client:
             payload = {"task": task}
@@ -393,10 +600,9 @@ async def computer_use_task_impl(task: str, url: str = "") -> str:
             resp = await client.post(f"{MAC_SERVICE_URL}/execute", json=payload, timeout=120)
             if resp.status_code == 200:
                 return resp.json().get("result", "執行完成（無詳細結果）")
-            else:
-                return f"Mac 服務回應錯誤（HTTP {resp.status_code}）：{resp.text[:200]}"
+            return f"Mac 服務回應錯誤（HTTP {resp.status_code}）"
     except httpx.ConnectError:
-        return "無法連接到 Mac 服務，Cloudflare tunnel 可能已過期，請重新啟動 mac-computer-use.py"
+        return "無法連接到 Mac 服務，Cloudflare tunnel 可能已過期"
     except Exception as e:
         return f"執行失敗：{str(e)}"
 
@@ -453,13 +659,9 @@ def do_read_emails(count: int = 5) -> str:
 
 
 def do_set_reminder(text: str, time_hint: str = "") -> str:
-    entry = {
-        "text": text,
-        "time_hint": time_hint,
-        "created": datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
+    entry = {"text": text, "time_hint": time_hint, "created": datetime.now().strftime("%Y-%m-%d %H:%M")}
     reminders.append(entry)
-    save_data()  # 立即寫檔，重啟不消失
+    save_data()
     hint_str = f"（{time_hint}）" if time_hint else ""
     return f"已記住{hint_str}：{text}"
 
@@ -493,8 +695,7 @@ def check_important_unread_emails() -> list[dict]:
             email_id = msg.get("Message-ID", str(num))
             if email_id in seen_email_ids:
                 continue
-            is_important = any(kw.lower() in subject.lower() for kw in IMPORTANT_EMAIL_KEYWORDS)
-            if not is_important:
+            if not any(kw.lower() in subject.lower() for kw in IMPORTANT_EMAIL_KEYWORDS):
                 continue
             sender = msg.get("From", "")
             body = ""
@@ -528,6 +729,17 @@ async def process_tool_call(tool_name: str, tool_input: dict) -> str:
         return do_set_reminder(tool_input["text"], tool_input.get("time_hint", ""))
     elif tool_name == "list_reminders":
         return do_list_reminders()
+    elif tool_name == "get_calendar":
+        return do_get_calendar(tool_input.get("days", 7))
+    elif tool_name == "add_calendar_event":
+        return do_add_calendar_event(
+            tool_input["title"], tool_input["start_datetime"], tool_input["end_datetime"],
+            tool_input.get("description", ""), tool_input.get("location", "")
+        )
+    elif tool_name == "search_knowledge_base":
+        return do_search_knowledge_base(tool_input["query"], tool_input.get("category", ""))
+    elif tool_name == "add_to_knowledge_base":
+        return do_add_to_knowledge_base(tool_input["category"], tool_input["title"], tool_input["content"])
     elif tool_name == "computer_use_task":
         return await computer_use_task_impl(tool_input["task"], tool_input.get("url", ""))
     return "未知工具"
@@ -666,41 +878,37 @@ async def send_line_push(user_id: str, text: str):
 # ── 自動排程任務 ───────────────────────────────────────
 
 async def scheduled_morning_briefing():
-    """每天早上 8:00（Asia/Ho_Chi_Minh）自動推晨報"""
     if not known_user_ids:
-        print("[scheduler] 晨報：沒有已知用戶，略過")
         return
-    print(f"[scheduler] 晨報開始，推播給 {len(known_user_ids)} 位用戶")
-
     today = datetime.now().strftime("%Y-%m-%d %A")
     hcmc_weather, taipei_weather = await asyncio.gather(
         get_weather_impl("Ho Chi Minh City"),
         get_weather_impl("Taipei")
     )
+    calendar_info = do_get_calendar(1)
     email_summary = do_read_emails(3)
     reminder_text = do_list_reminders()
 
     briefing_prompt = f"""今天是 {today}。
 
-胡志明市天氣：
-{hcmc_weather}
+胡志明市天氣：{hcmc_weather}
 
-台北天氣：
-{taipei_weather}
+台北天氣：{taipei_weather}
 
-最新郵件（最近3封）：
-{email_summary}
+今日行程：{calendar_info}
 
-待辦提醒：
-{reminder_text}
+最新郵件（最近3封）：{email_summary}
+
+待辦提醒：{reminder_text}
 
 請給 Aaron 一個晨報，格式：
-・今日天氣（兩個城市，一行搞定）
+・今日天氣（兩城市一行搞定）
+・今天有沒有重要行程
 ・最重要的 1-2 個待辦
-・郵件有沒有重要的（沒有就不用寫）
+・郵件有重要的才寫，沒有就不寫
 ・一句今日重點提醒
 
-要求：繁體中文，像朋友傳訊息，不用 Markdown，條列用「・」，總長度不超過15行。"""
+繁體中文，像朋友傳訊息，不用 Markdown，條列用「・」，不超過15行。"""
 
     response = await anthropic_client.messages.create(
         model="claude-sonnet-4-6",
@@ -709,25 +917,21 @@ async def scheduled_morning_briefing():
         messages=[{"role": "user", "content": briefing_prompt}]
     )
     briefing = response.content[0].text
-
     for uid in known_user_ids:
         await send_line_push(uid, briefing)
-    print(f"[scheduler] 晨報已推播")
+    print(f"[scheduler] 晨報已推播給 {len(known_user_ids)} 人")
 
 
 async def scheduled_evening_summary():
-    """每天晚上 22:00（Asia/Ho_Chi_Minh）自動推日報摘要"""
     if not known_user_ids:
         return
     if not daily_log:
-        msg = "今天沒有對話紀錄，一切平靜。"
         for uid in known_user_ids:
-            await send_line_push(uid, msg)
+            await send_line_push(uid, "今天沒有對話紀錄，一切平靜。")
         return
 
     log_text = "\n".join([f"[{i['time']}] Aaron：{i['user']}\n助理：{i['reply']}" for i in daily_log])
     date_str = datetime.now().strftime("%Y-%m-%d")
-
     response = await anthropic_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=600,
@@ -735,7 +939,6 @@ async def scheduled_evening_summary():
     )
     summary = response.content[0].text
     daily_log.clear()
-
     msg = f"今日摘要（{date_str}）\n\n{summary}"
     for uid in known_user_ids:
         await send_line_push(uid, msg)
@@ -743,7 +946,6 @@ async def scheduled_evening_summary():
 
 
 async def scheduled_proactive_check():
-    """每30分鐘掃一次重要未讀郵件"""
     if not known_user_ids:
         return
     important_emails = check_important_unread_emails()
@@ -783,7 +985,7 @@ async def webhook(request: Request):
 
         if user_id not in known_user_ids:
             known_user_ids.append(user_id)
-            save_data()  # 新用戶立即存檔
+            save_data()
 
         try:
             await send_loading_animation(user_id, seconds=60)
@@ -817,13 +1019,27 @@ async def webhook(request: Request):
             else:
                 user_text = event["message"]["text"]
 
+                # /kb 知識庫指令
+                if user_text.startswith("/kb ") or user_text.startswith("/知識庫 "):
+                    parts = user_text.split(" ", 3)
+                    # 格式：/kb [category] [title] [content]
+                    # 或：/kb list [category]
+                    if len(parts) >= 2 and parts[1] == "list":
+                        cat = parts[2] if len(parts) > 2 else ""
+                        reply = do_search_knowledge_base("", cat) if cat else "\n".join(
+                            [f"【{c}】{len(v)} 筆" for c, v in knowledge_base.items()]
+                        )
+                    elif len(parts) >= 4:
+                        reply = do_add_to_knowledge_base(parts[1], parts[2], parts[3])
+                    else:
+                        reply = "用法：\n/kb [clinic/herbalife/contacts/general] [標題] [內容]\n/kb list [分類]"
+                    await send_line_reply(reply_token, reply)
+                    continue
+
                 if user_text.startswith("/記住") or user_text.startswith("/remember"):
                     content = user_text.replace("/記住", "").replace("/remember", "").strip()
-                    if content:
-                        ok = save_to_memory(content)
-                        reply = "已記住。" if ok else "儲存失敗"
-                    else:
-                        reply = "用法：/記住 [要記的內容]"
+                    ok = save_to_memory(content) if content else False
+                    reply = "已記住。" if ok else "用法：/記住 [要記的內容]"
                     await send_line_reply(reply_token, reply)
                     continue
 
@@ -833,8 +1049,11 @@ async def webhook(request: Request):
                     continue
 
                 if user_text.strip() in ("/提醒", "/reminders"):
-                    reply = do_list_reminders()
-                    await send_line_reply(reply_token, reply)
+                    await send_line_reply(reply_token, do_list_reminders())
+                    continue
+
+                if user_text.strip() in ("/行程", "/calendar"):
+                    await send_line_reply(reply_token, do_get_calendar(7))
                     continue
 
                 reply = await chat_with_claude(user_id, user_text)
@@ -862,22 +1081,21 @@ async def health():
     import shutil
     return {
         "status": "ok",
-        "memory_loaded": bool(os.environ.get("MEMORY_CONTENT", "")) or MEMORY_PATH.exists(),
-        "groq_ready": bool(GROQ_API_KEY),
-        "ffmpeg_ready": shutil.which("ffmpeg") is not None,
         "gmail_ready": bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD),
-        "mac_service_ready": bool(MAC_SERVICE_URL),
+        "gcal_ready": bool(GOOGLE_SERVICE_ACCOUNT_JSON),
+        "groq_ready": bool(GROQ_API_KEY),
+        "brave_ready": bool(BRAVE_API_KEY),
+        "mac_ready": bool(MAC_SERVICE_URL),
+        "ffmpeg_ready": shutil.which("ffmpeg") is not None,
         "known_users": len(known_user_ids),
         "reminders": len(reminders),
-        "seen_email_ids": len(seen_email_ids),
-        "daily_log_count": len(daily_log),
+        "kb_entries": {k: len(v) for k, v in knowledge_base.items()},
         "scheduler_running": scheduler.running if scheduler else False
     }
 
 
 @app.get("/morning-briefing")
 async def morning_briefing(secret: str = ""):
-    """手動觸發晨報（排程器已自動處理，這個端點備用）"""
     if not SYNC_SECRET or secret != SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
     await scheduled_morning_briefing()
@@ -886,7 +1104,6 @@ async def morning_briefing(secret: str = ""):
 
 @app.get("/proactive-check")
 async def proactive_check(secret: str = ""):
-    """手動觸發郵件檢查（排程器已自動處理，這個端點備用）"""
     if not SYNC_SECRET or secret != SYNC_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
     await scheduled_proactive_check()
@@ -909,16 +1126,11 @@ scheduler = None
 async def startup():
     global scheduler
     scheduler = AsyncIOScheduler(timezone="Asia/Ho_Chi_Minh")
-
-    # 每天早上 8:00 推晨報
     scheduler.add_job(scheduled_morning_briefing, CronTrigger(hour=8, minute=0))
-    # 每天晚上 22:00 推日報
     scheduler.add_job(scheduled_evening_summary, CronTrigger(hour=22, minute=0))
-    # 每 30 分鐘掃重要郵件
     scheduler.add_job(scheduled_proactive_check, "interval", minutes=30)
-
     scheduler.start()
-    print(f"[startup] JARVIS 啟動完成，排程器已啟動，已知用戶：{len(known_user_ids)} 人")
+    print(f"[startup] JARVIS 啟動完成，已知用戶：{len(known_user_ids)} 人，知識庫：{sum(len(v) for v in knowledge_base.values())} 筆")
 
 
 if __name__ == "__main__":
