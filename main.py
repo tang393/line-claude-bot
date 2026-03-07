@@ -49,7 +49,7 @@ MEMORY_PATH   = Path.home() / ".claude/projects/-Users-user/memory/MEMORY.md"
 LINE_LOG_PATH = Path.home() / ".claude/projects/-Users-user/memory/line-conversations.md"
 DATA_PATH     = Path("/tmp/jarvis_data.json")
 KB_PATH       = Path("/tmp/jarvis_kb.json")
-MAX_HISTORY   = 20
+MAX_HISTORY   = 8
 
 IMPORTANT_EMAIL_KEYWORDS = [
     "合約", "協議", "緊急", "urgent", "important", "付款", "帳單", "invoice",
@@ -141,7 +141,7 @@ def get_memory() -> str:
     if LINE_LOG_PATH.exists():
         log = LINE_LOG_PATH.read_text(encoding="utf-8").strip()
         if log:
-            content += f"\n\n# 近期 LINE 對話重點\n{log}"
+            content += f"\n\n# 近期 LINE 對話重點\n{log[-500:]}"
     if reminders:
         reminder_text = "\n".join([f"・{r['text']}（設定於 {r['created']}）" for r in reminders])
         content += f"\n\n# 待辦提醒\n{reminder_text}"
@@ -193,56 +193,9 @@ def build_system_prompt() -> str:
 # 用戶背景
 {memory}
 
-# 強制工具使用規則（最高優先指令）
-
-【一定要呼叫 web_search 的情況】
-・任何涉及「最新」「現在」「今天」「近期」「最近」的資訊
-・市場數據、競品、法規、新聞、股價、匯率、越南法規
-・你不確定是否為最新資訊的任何問題
-・Aaron 問「...怎麼樣」「...有沒有」「...是多少」需要確認的問題
-・禁止說「我不知道最新情況」然後不搜尋，直接搜！
-
-【一定要呼叫 get_weather 的情況】
-・任何提到天氣、氣溫、下雨、濕度、颱風
-
-【一定要呼叫 search_knowledge_base 的情況】
-・問到診所 SOP、療程、價格、服務流程
-・問到賀寶芙產品、獎銜制度、活動、佣金
-・問到任何人名、聯絡資訊
-・先搜知識庫，再決定要不要補充搜尋網路
-
-【一定要呼叫 get_calendar 的情況】
-・問到「有沒有行程」「明天幾點」「這週安排」「日程表」「行事曆」
-
-【一定要呼叫 read_emails 的情況】
-・Aaron 說「信」「郵件」「mail」「有沒有人聯絡我」
-
-【一定要呼叫 set_reminder 的情況】
-・Aaron 說「記住」「提醒」「待辦」「別忘了」「要記得」
-
-【一定要呼叫 convert_currency 的情況】
-・提到越南盾、台幣、美金的換算
-・問「多少錢」涉及跨幣別
-・報價涉及不同貨幣時主動換算
-
-【一定要呼叫 delete_reminder 的情況】
-・Aaron 說「完成了」「刪掉第X個」「取消待辦」
-
-# 可用工具
-web_search：搜尋網路最新資訊
-get_weather：查天氣（預設查胡志明市+台北）
-browse_url：直接讀取指定網址內容
-send_email：代 Aaron 發郵件（發前須確認，除非 Aaron 說直接發）
-read_emails：讀 Gmail 最新郵件
-set_reminder：存提醒/待辦（永久保存）
-list_reminders：列出所有待辦
-delete_reminder：完成/刪除待辦
-get_calendar：查 Google Calendar 行程（狀態：{gcal_status}）
-add_calendar_event：新增 Google Calendar 行程（狀態：{gcal_status}）
-search_knowledge_base：搜尋知識庫（診所SOP/賀寶芙/人脈）
-add_to_knowledge_base：新增知識庫條目
-convert_currency：即時匯率換算（VND/TWD/USD 等）
-computer_use_task：讓 Mac 執行實際操作（狀態：{mac_status}）
+# 工具使用原則
+需要最新資訊→web_search，天氣→get_weather，幣別→convert_currency，行程→get_calendar/add_calendar_event，郵件→read_emails/send_email，記事→set_reminder/delete_reminder/list_reminders，知識庫→search_knowledge_base/add_to_knowledge_base，網頁→browse_url，Mac操作→computer_use_task
+不確定就搜，別說「我不知道」。一次用對的工具，不要重複呼叫。
 
 # 工作流程
 收到任務 → 判斷需要哪些工具 → 先執行工具 → 整合結果直接給答案/成品
@@ -943,11 +896,11 @@ async def chat_with_claude(user_id: str, user_message: str, media_images: list[b
     messages = conversation_history[user_id][:-1].copy()
     messages.append({"role": "user", "content": current_content})
 
-    for _ in range(8):
+    for _ in range(3):
         response = await anthropic_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=build_system_prompt(),
+            max_tokens=1200,
+            system=[{"type": "text", "text": build_system_prompt(), "cache_control": {"type": "ephemeral"}}],
             tools=TOOLS,
             messages=messages
         )
@@ -1162,8 +1115,7 @@ async def scheduled_morning_briefing():
 
     response = await anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
-        system=build_system_prompt(),
+        max_tokens=400,
         messages=[{"role": "user", "content": briefing_prompt}]
     )
     briefing = response.content[0].text
@@ -1184,7 +1136,7 @@ async def scheduled_evening_summary():
     date_str = datetime.now().strftime("%Y-%m-%d")
     response = await anthropic_client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        max_tokens=300,
         messages=[{"role": "user", "content": f"以下是 {date_str} 的 LINE 對話，請用繁體中文摘要 3-5 個重點（決策、待辦、重要資訊、結論）。不用 Markdown，條列用「・」。沒重要內容就寫「今日無重要事項」。\n\n{log_text}"}]
     )
     summary = response.content[0].text
