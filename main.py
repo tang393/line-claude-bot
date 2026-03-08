@@ -52,12 +52,6 @@ KB_PATH       = Path("/tmp/jarvis_kb.json")
 EXPENSE_PATH  = Path("/tmp/jarvis_expenses.json")
 MAX_HISTORY   = 8
 
-IMPORTANT_EMAIL_KEYWORDS = [
-    "合約", "協議", "緊急", "urgent", "important", "付款", "帳單", "invoice",
-    "overdue", "逾期", "截止", "deadline", "簽約", "URGENT", "ACTION REQUIRED",
-    "開幕", "執照", "股東", "律師", "legal", "court", "lawsuit", "罰款"
-]
-
 # ── 持久化狀態 ─────────────────────────────────────────
 
 def _load_json(path: Path, gdrive_name: str, default: dict) -> dict:
@@ -78,7 +72,7 @@ def _load_json(path: Path, gdrive_name: str, default: dict) -> dict:
 
 def load_data() -> dict:
     return _load_json(DATA_PATH, "jarvis_data.json",
-                      {"known_user_ids": [], "reminders": [], "seen_email_ids": [], "countdowns": []})
+                      {"known_user_ids": [], "reminders": [], "countdowns": []})
 
 def save_data():
     try:
@@ -86,7 +80,6 @@ def save_data():
         payload = {
             "known_user_ids": known_user_ids,
             "reminders": reminders,
-            "seen_email_ids": list(seen_email_ids),
             "countdowns": countdowns
         }
         content = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -127,7 +120,6 @@ conversation_history: dict[str, list] = {}
 daily_log: list = []
 known_user_ids: list = _data.get("known_user_ids", [])
 reminders: list = _data.get("reminders", [])
-seen_email_ids: set = set(_data.get("seen_email_ids", []))
 countdowns: list = _data.get("countdowns", [])
 knowledge_base: dict = load_kb()
 expenses: list = load_expenses()
@@ -951,46 +943,6 @@ def do_list_reminders() -> str:
     return "待辦提醒清單：\n" + "\n".join(lines)
 
 
-def check_important_unread_emails() -> list[dict]:
-    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return []
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        mail.select("INBOX")
-        _, data = mail.search(None, "UNSEEN")
-        ids = data[0].split()
-        if not ids:
-            mail.logout()
-            return []
-        important = []
-        for num in ids[-30:]:
-            _, msg_data = mail.fetch(num, "(RFC822)")
-            msg = email_lib.message_from_bytes(msg_data[0][1])
-            subject_raw = decode_header(msg["Subject"] or "")[0]
-            subject = subject_raw[0].decode(subject_raw[1] or "utf-8") if isinstance(subject_raw[0], bytes) else (subject_raw[0] or "")
-            email_id = msg.get("Message-ID", str(num))
-            if email_id in seen_email_ids:
-                continue
-            if not any(kw.lower() in subject.lower() for kw in IMPORTANT_EMAIL_KEYWORDS):
-                continue
-            sender = msg.get("From", "")
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body = part.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
-                        break
-            else:
-                body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")[:300]
-            important.append({"id": email_id, "from": sender[:60], "subject": subject[:80], "preview": body})
-        mail.logout()
-        return important
-    except Exception as e:
-        print(f"[proactive_check] email error: {e}")
-        return []
-
-
 async def process_tool_call(tool_name: str, tool_input: dict) -> str:
     if tool_name == "web_search":
         return await brave_search(tool_input["query"])
@@ -1145,8 +1097,8 @@ def build_quick_reply():
         "items": [
             {"type": "action", "action": {"type": "message", "label": "查行程", "text": "/行程"}},
             {"type": "action", "action": {"type": "message", "label": "查天氣", "text": "今天天氣"}},
-            {"type": "action", "action": {"type": "message", "label": "查郵件", "text": "有沒有新郵件"}},
             {"type": "action", "action": {"type": "message", "label": "待辦清單", "text": "/提醒"}},
+            {"type": "action", "action": {"type": "message", "label": "匯率", "text": "/匯率"}},
             {"type": "action", "action": {"type": "message", "label": "記帳報表", "text": "這個月花了多少"}},
         ]
     }
@@ -1251,7 +1203,6 @@ async def scheduled_morning_briefing():
         convert_currency_impl(1000000, "VND", "TWD")
     )
     calendar_info = do_get_calendar(1)
-    email_summary = do_read_emails(3)
     reminder_text = do_list_reminders()
     countdown_text = get_countdown_text()
 
@@ -1265,8 +1216,6 @@ async def scheduled_morning_briefing():
 
 今日行程：{calendar_info}
 
-最新郵件（最近3封）：{email_summary}
-
 待辦提醒：{reminder_text}
 
 倒計時：{countdown_text if countdown_text else '無'}
@@ -1277,7 +1226,6 @@ async def scheduled_morning_briefing():
 ・倒計時（有的話列出來）
 ・今天有沒有重要行程
 ・最重要的 1-2 個待辦
-・郵件有重要的才寫，沒有就不寫
 ・一句今日重點提醒
 
 繁體中文，像朋友傳訊息，不用 Markdown，條列用「・」，不超過15行。"""
@@ -1314,20 +1262,6 @@ async def scheduled_evening_summary():
     for uid in known_user_ids:
         await send_line_push(uid, msg)
     print(f"[scheduler] 晚報已推播")
-
-
-async def scheduled_proactive_check():
-    if not known_user_ids:
-        return
-    important_emails = check_important_unread_emails()
-    for em in important_emails:
-        if em["id"] not in seen_email_ids:
-            msg = f"重要郵件提醒\n\n寄件人：{em['from']}\n主旨：{em['subject']}\n\n{em['preview'][:200]}"
-            for uid in known_user_ids:
-                await send_line_push(uid, msg)
-            seen_email_ids.add(em["id"])
-    if important_emails:
-        save_data()
 
 
 # ── Webhook ───────────────────────────────────────────
@@ -1512,14 +1446,6 @@ async def morning_briefing(secret: str = ""):
     return {"status": "sent", "recipients": len(known_user_ids)}
 
 
-@app.get("/proactive-check")
-async def proactive_check(secret: str = ""):
-    if not SYNC_SECRET or secret != SYNC_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await scheduled_proactive_check()
-    return {"status": "ok"}
-
-
 @app.get("/daily-summary")
 async def daily_summary(secret: str = ""):
     if not SYNC_SECRET or secret != SYNC_SECRET:
@@ -1538,7 +1464,6 @@ async def startup():
     scheduler = AsyncIOScheduler(timezone="Asia/Ho_Chi_Minh")
     scheduler.add_job(scheduled_morning_briefing, CronTrigger(hour=8, minute=0))
     scheduler.add_job(scheduled_evening_summary, CronTrigger(hour=22, minute=0))
-    scheduler.add_job(scheduled_proactive_check, "interval", minutes=30)
     # 恢復對話記錄
     if not LINE_LOG_PATH.exists():
         try:
